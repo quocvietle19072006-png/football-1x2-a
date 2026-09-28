@@ -37,12 +37,36 @@ def api_get(path, params=None):
     try:
         data = r.json()
     except ValueError:
-        ct = r.headers.get("content-type", "")
-        preview = r.text[:500].replace("\n", " ").strip()
-        raise RuntimeError(
-            f"API không trả JSON (HTTP {r.status_code}, Content-Type: {ct}). "
-            f"Phản hồi: {preview}"
-        )
+        # SportAPI may prepend a PHP warning/HTML before the JSON body.
+        # Extract the JSON object beginning with the actual API payload.
+        import json
+        raw = r.text.lstrip("\ufeff \r\n\t")
+        start = raw.find('{"success"')
+        if start < 0:
+            start = raw.find('{')
+        if start >= 0:
+            candidate = raw[start:]
+            try:
+                data = json.loads(candidate)
+            except ValueError:
+                # Try the last closing brace in case there is trailing HTML.
+                end = candidate.rfind('}')
+                if end >= 0:
+                    try:
+                        data = json.loads(candidate[:end + 1])
+                    except ValueError:
+                        data = None
+                else:
+                    data = None
+        else:
+            data = None
+        if data is None:
+            ct = r.headers.get("content-type", "")
+            preview = r.text[:700].replace("\n", " ").strip()
+            raise RuntimeError(
+                f"API không trả JSON hợp lệ (HTTP {r.status_code}, Content-Type: {ct}). "
+                f"Phản hồi: {preview}"
+            )
     if isinstance(data, dict) and data.get("success") is False:
         raise RuntimeError(str(data))
     return data
