@@ -1,8 +1,10 @@
 import os
 import math
-import requests
+from datetime import datetime, timezone
+
 import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
 from sklearn.linear_model import LogisticRegression
 
@@ -14,243 +16,357 @@ st.set_page_config(
 
 st.markdown("""
 <style>
-.block-container {padding: 1rem 0.8rem 2rem 0.8rem; max-width: 760px;}
+.block-container {max-width: 760px; padding-top: 1rem; padding-bottom: 2rem;}
 h1 {font-size: 2rem !important;}
-div[data-testid="stMetric"] {border: 1px solid #ddd; border-radius: 12px; padding: 10px;}
+div[data-testid="stMetricValue"] {font-size: 1.45rem;}
+.small-note {font-size: .85rem; opacity: .75;}
 </style>
 """, unsafe_allow_html=True)
 
-TOKEN = st.secrets.get("FOOTBALL_DATA_TOKEN", os.getenv("FOOTBALL_DATA_TOKEN", ""))
-BASE = "https://api.football-data.org/v4"
+BASE_URL = "https://v3.football.api-sports.io"
+API_KEY = st.secrets.get("API_FOOTBALL_KEY", os.getenv("API_FOOTBALL_KEY", ""))
 
-# More competitions. Access still depends on the Football-Data.org plan.
-COMPETITIONS = {
-    "🏴 England — Premier League": "PL",
-    "🏴 England — Championship": "ELC",
-    "🏴 England — League One": "EL1",
-    "🏴 England — League Two": "EL2",
-    "🏴 England — National League": "ENL",
+if not API_KEY:
+    st.title("⚽ Football 1X2 AI")
+    st.error("Chưa có API_FOOTBALL_KEY trong Secrets.")
+    st.info("Vào Streamlit → Settings/Manage app → Secrets và thêm: API_FOOTBALL_KEY = \"API_KEY_CUA_BAN\"")
+    st.stop()
 
-    "🇪🇸 Spain — La Liga": "PD",
-    "🇪🇸 Spain — Segunda Division": "SD",
 
-    "🇩🇪 Germany — Bundesliga": "BL1",
-    "🇩🇪 Germany — 2. Bundesliga": "BL2",
-    "🇩🇪 Germany — 3. Bundesliga": "BL3",
-
-    "🇮🇹 Italy — Serie A": "SA",
-    "🇮🇹 Italy — Serie B": "SB",
-
-    "🇫🇷 France — Ligue 1": "FL1",
-    "🇫🇷 France — Ligue 2": "FL2",
-
-    "🇳🇱 Netherlands — Eredivisie": "DED",
-    "🇵🇹 Portugal — Primeira Liga": "PPL",
-    "🇬🇷 Greece — Super League": "GSL",
-
-    "🌍 UEFA — Champions League": "CL",
-    "🌍 UEFA — Europa League": "EL",
-    "🌍 UEFA — Conference League": "EC",
-
-    "🇧🇷 Brazil — Serie A": "BSA",
-    "🇦🇷 Argentina — Primera Division": "PPL",
-    "🇺🇸 USA — MLS": "MLS",
-    "🇲🇽 Mexico — Liga MX": "LMX",
-}
-
-@st.cache_data(ttl=900)
-def api_get(path, params=None):
-    if not TOKEN:
-        return {}
-    r = requests.get(
-        BASE + path,
-        headers={"X-Auth-Token": TOKEN},
-        params=params or {},
-        timeout=30,
-    )
-    r.raise_for_status()
-    return r.json()
-
-def form_features(matches, team):
-    past = [
-        m for m in matches
-        if m.get("status") == "FINISHED"
-        and (
-            m.get("homeTeam", {}).get("name") == team
-            or m.get("awayTeam", {}).get("name") == team
+def api_get(endpoint, params=None):
+    headers = {"x-apisports-key": API_KEY}
+    try:
+        r = requests.get(
+            f"{BASE_URL}/{endpoint}",
+            headers=headers,
+            params=params or {},
+            timeout=30,
         )
-    ]
-    past = sorted(past, key=lambda x: x.get("utcDate", ""))[-5:]
-    pts, gf, ga = [], [], []
+        remaining = r.headers.get("x-ratelimit-requests-remaining", "?")
+        if r.status_code != 200:
+            try:
+                body = r.json()
+                errors = body.get("errors", {})
+            except Exception:
+                errors = r.text[:300]
+            raise RuntimeError(f"HTTP {r.status_code} — {errors} — còn khoảng {remaining} request hôm nay.")
+        data = r.json()
+        if data.get("errors"):
+            raise RuntimeError(f"{data['errors']} — còn khoảng {remaining} request hôm nay.")
+        return data, remaining
+    except requests.RequestException as e:
+        raise RuntimeError(f"Không kết nối được API: {e}")
 
-    for m in past:
-        hs = (m.get("score", {}).get("fullTime", {}) or {}).get("home")
-        aws = (m.get("score", {}).get("fullTime", {}) or {}).get("away")
-        if hs is None or aws is None:
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def load_leagues():
+    data, remaining = api_get("leagues", {"current": "true"})
+    rows = []
+    for item in data.get("response", []):
+        league = item.get("league", {})
+        country = item.get("country", {})
+        seasons = item.get("seasons") or []
+        if league.get("type") != "League":
             continue
+        current_seasons = [s for s in seasons if s.get("current")]
+        season_obj = current_seasons[-1] if current_seasons else (seasons[-1] if seasons else {})
+        year = season_obj.get("year")
+        if not league.get("id") or not league.get("name") or not year:
+            continue
+        rows.append({
+            "id": int(league["id"]),
+            "name": league["name"],
+            "country": country.get("name") or "Other",
+            "flag": country.get("flag") or "",
+            "season": int(year),
+        })
+    df = pd.DataFrame(rows).drop_duplicates(subset=["id"])
+    if not df.empty:
+        df = df.sort_values(["country", "name"]).reset_index(drop=True)
+    return df, remaining
 
-        is_home = m.get("homeTeam", {}).get("name") == team
-        scored, conceded = (hs, aws) if is_home else (aws, hs)
-        gf.append(scored)
-        ga.append(conceded)
-        pts.append(3 if scored > conceded else 1 if scored == conceded else 0)
 
-    return (
-        float(np.mean(pts)) if pts else 1.0,
-        float(np.mean(gf)) if gf else 1.0,
-        float(np.mean(ga)) if ga else 1.0,
+@st.cache_data(ttl=1800, show_spinner=False)
+def load_finished(league_id, season):
+    data, remaining = api_get(
+        "fixtures",
+        {"league": int(league_id), "season": int(season), "status": "FT-AET-PEN"},
     )
+    rows = []
+    for x in data.get("response", []):
+        status = x.get("fixture", {}).get("status", {}).get("short")
+        if status not in {"FT", "AET", "PEN"}:
+            continue
+        home = x.get("teams", {}).get("home", {})
+        away = x.get("teams", {}).get("away", {})
+        goals = x.get("goals", {})
+        if not home.get("id") or not away.get("id"):
+            continue
+        gh, ga = goals.get("home"), goals.get("away")
+        if gh is None or ga is None:
+            continue
+        rows.append({
+            "date": x.get("fixture", {}).get("date", ""),
+            "home_id": int(home["id"]),
+            "away_id": int(away["id"]),
+            "home": home.get("name", "Home"),
+            "away": away.get("name", "Away"),
+            "gh": int(gh),
+            "ga": int(ga),
+        })
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df["date"] = pd.to_datetime(df["date"], utc=True, errors="coerce")
+        df = df.sort_values("date")
+    return df, remaining
 
-def build_training(matches):
+
+@st.cache_data(ttl=900, show_spinner=False)
+def load_next(league_id, season):
+    data, remaining = api_get(
+        "fixtures",
+        {"league": int(league_id), "season": int(season), "next": 30},
+    )
+    rows = []
+    for x in data.get("response", []):
+        status = x.get("fixture", {}).get("status", {}).get("short")
+        if status not in {"NS", "TBD"}:
+            continue
+        home = x.get("teams", {}).get("home", {})
+        away = x.get("teams", {}).get("away", {})
+        if not home.get("id") or not away.get("id"):
+            continue
+        rows.append({
+            "fixture_id": int(x.get("fixture", {}).get("id")),
+            "date": x.get("fixture", {}).get("date", ""),
+            "home_id": int(home["id"]),
+            "away_id": int(away["id"]),
+            "home": home.get("name", "Home"),
+            "away": away.get("name", "Away"),
+        })
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df["date"] = pd.to_datetime(df["date"], utc=True, errors="coerce")
+        df = df.sort_values("date")
+    return df, remaining
+
+
+def team_stats(history, team_id, before_date=None, window=12):
+    h = history
+    if before_date is not None and not h.empty:
+        h = h[h["date"] < before_date]
+    if h.empty:
+        return {"matches": 0, "gf": 1.25, "ga": 1.25, "points": 1.2, "win": .33, "draw": .34, "loss": .33}
+
+    mask = (h["home_id"] == team_id) | (h["away_id"] == team_id)
+    t = h.loc[mask].tail(window)
+    if t.empty:
+        return {"matches": 0, "gf": 1.25, "ga": 1.25, "points": 1.2, "win": .33, "draw": .34, "loss": .33}
+
+    gf, ga, pts = [], [], []
+    wins = draws = losses = 0
+    for _, r in t.iterrows():
+        if int(r.home_id) == team_id:
+            a, b = int(r.gh), int(r.ga)
+        else:
+            a, b = int(r.ga), int(r.gh)
+        gf.append(a)
+        ga.append(b)
+        if a > b:
+            wins += 1; pts.append(3)
+        elif a == b:
+            draws += 1; pts.append(1)
+        else:
+            losses += 1; pts.append(0)
+
+    n = len(t)
+    return {
+        "matches": n,
+        "gf": float(np.mean(gf)),
+        "ga": float(np.mean(ga)),
+        "points": float(np.mean(pts)),
+        "win": wins / n,
+        "draw": draws / n,
+        "loss": losses / n,
+    }
+
+
+def poisson_probs(lam_home, lam_away, max_goals=8):
+    ph = [math.exp(-lam_home) * lam_home**k / math.factorial(k) for k in range(max_goals + 1)]
+    pa = [math.exp(-lam_away) * lam_away**k / math.factorial(k) for k in range(max_goals + 1)]
+    p1 = px = p2 = 0.0
+    for i, a in enumerate(ph):
+        for j, b in enumerate(pa):
+            p = a * b
+            if i > j: p1 += p
+            elif i == j: px += p
+            else: p2 += p
+    total = p1 + px + p2
+    return np.array([p1, px, p2]) / total
+
+
+def build_ml(history):
+    if len(history) < 30:
+        return None
+
     rows, y = [], []
+    for _, r in history.iterrows():
+        hs = team_stats(history, int(r.home_id), r.date, 10)
+        aas = team_stats(history, int(r.away_id), r.date, 10)
+        rows.append([
+            hs["gf"] - aas["ga"],
+            aas["gf"] - hs["ga"],
+            hs["points"] - aas["points"],
+            hs["win"] - aas["win"],
+            hs["draw"] - aas["draw"],
+            hs["loss"] - aas["loss"],
+        ])
+        if r.gh > r.ga: y.append(0)
+        elif r.gh == r.ga: y.append(1)
+        else: y.append(2)
 
-    for m in matches:
-        if m.get("status") != "FINISHED":
-            continue
+    if len(set(y)) < 3:
+        return None
 
-        hs = (m.get("score", {}).get("fullTime", {}) or {}).get("home")
-        aws = (m.get("score", {}).get("fullTime", {}) or {}).get("away")
-        if hs is None or aws is None:
-            continue
+    model = LogisticRegression(max_iter=1000, multi_class="auto")
+    model.fit(np.asarray(rows), np.asarray(y))
+    return model
 
-        home = m.get("homeTeam", {}).get("name")
-        away = m.get("awayTeam", {}).get("name")
-        if not home or not away:
-            continue
 
-        hp, hgf, hga = form_features(matches, home)
-        ap, agf, aga = form_features(matches, away)
+def predict(history, home_id, away_id, fixture_date=None):
+    hs = team_stats(history, home_id, fixture_date, 12)
+    aas = team_stats(history, away_id, fixture_date, 12)
 
-        rows.append([hp-ap, hgf-agf, hga-aga, hgf-aga, 0.15])
-        y.append(0 if hs == aws else 1 if hs > aws else 2)
-
-    return np.asarray(rows), np.asarray(y)
-
-def poisson_probs(lh, la):
-    vals = np.zeros(3)
-
-    for h in range(8):
-        ph = math.exp(-lh) * lh**h / math.factorial(h)
-        for a in range(8):
-            pa = math.exp(-la) * la**a / math.factorial(a)
-            p = ph * pa
-            vals[0] += p if h > a else 0
-            vals[1] += p if h == a else 0
-            vals[2] += p if h < a else 0
-
-    total = vals.sum()
-    return vals / total if total else np.array([1/3, 1/3, 1/3])
-
-def predict(home, away, matches):
-    hp, hgf, hga = form_features(matches, home)
-    ap, agf, aga = form_features(matches, away)
-
-    X, y = build_training(matches)
-
-    if len(X) >= 30 and len(np.unique(y)) >= 3:
-        model = LogisticRegression(max_iter=2000)
-        model.fit(X, y)
-
-        x = np.array([[hp-ap, hgf-agf, hga-aga, hgf-aga, 0.15]])
-        raw = model.predict_proba(x)[0]
-
-        ml = np.zeros(3)
-        for cls, p in zip(model.classes_, raw):
-            ml[int(cls)] = p
-    else:
-        ml = np.array([0.40, 0.28, 0.32])
-
-    home_xg = max(0.25, min(4.0, 1.45 + 0.28*(hgf-agf) - 0.18*(hga-aga)))
-    away_xg = max(0.20, min(4.0, 1.15 - 0.20*(hgf-agf) + 0.18*(hga-aga)))
+    # Conservative attack/defence blend + small home advantage.
+    home_xg = max(0.20, 0.58 * hs["gf"] + 0.42 * aas["ga"] + 0.18)
+    away_xg = max(0.20, 0.58 * aas["gf"] + 0.42 * hs["ga"])
 
     poi = poisson_probs(home_xg, away_xg)
-    final = 0.72 * ml + 0.28 * poi
-    final = final / final.sum()
 
-    return final, home_xg, away_xg
+    model = build_ml(history)
+    if model is not None:
+        feat = np.array([[
+            hs["gf"] - aas["ga"],
+            aas["gf"] - hs["ga"],
+            hs["points"] - aas["points"],
+            hs["win"] - aas["win"],
+            hs["draw"] - aas["draw"],
+            hs["loss"] - aas["loss"],
+        ]])
+        ml_raw = model.predict_proba(feat)[0]
+        ml = np.zeros(3)
+        for cls, p in zip(model.classes_, ml_raw):
+            ml[int(cls)] = p
+        final = 0.72 * ml + 0.28 * poi
+    else:
+        final = poi
+
+    final = final / final.sum()
+    return final, home_xg, away_xg, hs, aas
+
 
 st.title("⚽ Football 1X2 AI")
-st.caption("Dự đoán xác suất 1X2 từ dữ liệu trận đấu")
-
-if not TOKEN:
-    st.error("Chưa có FOOTBALL_DATA_TOKEN trong Secrets.")
-    st.stop()
-
-competition = st.selectbox("Giải đấu", list(COMPETITIONS.keys()))
-code = COMPETITIONS[competition]
+st.caption("Dữ liệu API-Football • mô hình ML + Poisson • tối ưu cho điện thoại")
 
 try:
-    finished_data = api_get(
-        f"/competitions/{code}/matches",
-        {"status": "FINISHED"}
-    )
-    upcoming_data = api_get(
-        f"/competitions/{code}/matches",
-        {"status": "SCHEDULED"}
-    )
-
-    finished = finished_data.get("matches", [])
-    upcoming = upcoming_data.get("matches", [])
-
-except requests.HTTPError as e:
-    status = getattr(e.response, "status_code", None)
-    if status == 403:
-        st.error(
-            "Giải đấu này không nằm trong quyền truy cập của gói API hiện tại "
-            "(HTTP 403). Hãy kiểm tra gói Football-Data.org."
-        )
-    elif status == 429:
-        st.error("API đang giới hạn số lượt gọi. Vui lòng thử lại sau.")
-    else:
-        st.error(f"Không lấy được dữ liệu bóng đá: {e}")
-    st.stop()
-
+    leagues, remaining = load_leagues()
 except Exception as e:
-    st.error(f"Không lấy được dữ liệu bóng đá: {e}")
+    st.error(f"Không tải được danh sách giải: {e}")
     st.stop()
 
-if not finished:
-    st.warning(
-        "Giải đấu chưa có dữ liệu lịch sử hoặc token hiện tại không có quyền truy cập."
-    )
+if leagues.empty:
+    st.warning("API không trả về giải đấu đang hoạt động.")
     st.stop()
 
-teams = sorted({
-    t
-    for m in finished
-    for t in [
-        m.get("homeTeam", {}).get("name"),
-        m.get("awayTeam", {}).get("name")
+c1, c2 = st.columns(2)
+with c1:
+    countries = ["Tất cả"] + sorted(leagues["country"].dropna().unique().tolist())
+    country = st.selectbox("🌍 Quốc gia", countries)
+with c2:
+    search = st.text_input("🔎 Tìm giải", placeholder="National League...")
+
+filtered = leagues.copy()
+if country != "Tất cả":
+    filtered = filtered[filtered["country"] == country]
+if search.strip():
+    q = search.strip().lower()
+    filtered = filtered[
+        filtered["name"].str.lower().str.contains(q, na=False)
+        | filtered["country"].str.lower().str.contains(q, na=False)
     ]
-    if t
-})
 
-if len(teams) < 2:
-    st.warning("Không đủ đội để tạo trận đấu.")
+if filtered.empty:
+    st.warning("Không tìm thấy giải phù hợp.")
     st.stop()
 
-st.subheader("Chọn trận")
+filtered["label"] = filtered.apply(
+    lambda r: f"{r['flag']} {r['country']} — {r['name']} ({r['season']})".strip(),
+    axis=1,
+)
+choice = st.selectbox("🏆 Chọn giải đấu", filtered["label"].tolist())
+league_row = filtered[filtered["label"] == choice].iloc[0]
+league_id = int(league_row["id"])
+season = int(league_row["season"])
 
-home = st.selectbox("Đội nhà", teams, index=0)
-away_options = [t for t in teams if t != home]
-away = st.selectbox("Đội khách", away_options, index=0)
+st.caption(f"League ID: {league_id} • Season: {season} • API còn khoảng: {remaining} request/ngày")
 
-if st.button("🔮 Dự đoán 1X2", use_container_width=True):
-    p, xg_h, xg_a = predict(home, away, finished)
+try:
+    with st.spinner("Đang tải dữ liệu trận đấu..."):
+        history, rem1 = load_finished(league_id, season)
+        upcoming, rem2 = load_next(league_id, season)
+except Exception as e:
+    st.error(f"Không tải được dữ liệu giải này: {e}")
+    st.stop()
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("1 — Chủ nhà", f"{p[0]*100:.1f}%")
-    c2.metric("X — Hòa", f"{p[1]*100:.1f}%")
-    c3.metric("2 — Khách", f"{p[2]*100:.1f}%")
+if upcoming.empty:
+    st.warning("Chưa có trận sắp tới trong dữ liệu API cho giải này.")
+    st.stop()
 
-    st.subheader("⚽ Kỳ vọng bàn thắng")
-    c1, c2 = st.columns(2)
-    c1.metric(home, f"{xg_h:.2f} xG")
-    c2.metric(away, f"{xg_a:.2f} xG")
+upcoming["label"] = upcoming.apply(
+    lambda r: f"{r['date'].strftime('%d/%m %H:%M UTC')} — {r['home']} vs {r['away']}",
+    axis=1,
+)
+fixture_choice = st.selectbox("⚽ Chọn trận", upcoming["label"].tolist())
+fixture = upcoming[upcoming["label"] == fixture_choice].iloc[0]
 
-    labels = ["1 — Chủ nhà", "X — Hòa", "2 — Khách"]
-    result = labels[int(np.argmax(p))]
-    st.info(f"Xác suất cao nhất theo mô hình: **{result}**")
+probs, xg_h, xg_a, hs, aas = predict(
+    history,
+    int(fixture["home_id"]),
+    int(fixture["away_id"]),
+    fixture["date"],
+)
 
 st.divider()
-st.caption(f"Dữ liệu: Football-Data.org • {competition}")
+st.subheader(f"{fixture['home']}  vs  {fixture['away']}")
+
+cols = st.columns(3)
+labels = [("1", "Chủ nhà"), ("X", "Hòa"), ("2", "Đội khách")]
+for col, (k, name), p in zip(cols, labels, probs):
+    with col:
+        st.metric(f"{k} — {name}", f"{p*100:.1f}%")
+
+winner = ["1 — Chủ nhà", "X — Hòa", "2 — Đội khách"][int(np.argmax(probs))]
+st.success(f"Xác suất cao nhất: **{winner}**")
+
+x1, x2 = st.columns(2)
+with x1:
+    st.metric("xG chủ nhà", f"{xg_h:.2f}")
+with x2:
+    st.metric("xG đội khách", f"{xg_a:.2f}")
+
+st.write(
+    f"Form gần đây: **{fixture['home']}** {hs['matches']} trận, "
+    f"{hs['points']:.2f} điểm/trận • **{fixture['away']}** {aas['matches']} trận, "
+    f"{aas['points']:.2f} điểm/trận."
+)
+
+st.caption(
+    "Lưu ý: đây là xác suất mô hình, không phải kết quả chắc chắn. "
+    "API-Football Free hiện giới hạn 100 request/ngày; app có cache để giảm số lần gọi."
+)
+
+with st.expander("ℹ️ Cách hoạt động"):
+    st.write(
+        "App lấy danh sách giải đang hoạt động từ API-Football, sau đó tải lịch sử "
+        "trận đã kết thúc và các trận sắp tới của giải được chọn. "
+        "Dự đoán kết hợp Logistic Regression (nếu đủ dữ liệu) với Poisson xG."
