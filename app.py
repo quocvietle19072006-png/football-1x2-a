@@ -66,13 +66,22 @@ def load_leagues():
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def load_future(league_id, number=30):
-    # Deliberately do NOT send season.
-    # This avoids the Free-plan current-season restriction that affected
-    # England National League (league 43) in the previous version.
+def load_future(league_id, days=45):
+    # Do NOT use the "next" parameter: the Free plan currently blocks it.
+    # Instead, request a date range for the next 45 days.
+    from datetime import datetime, timedelta, timezone
+
+    today = datetime.now(timezone.utc).date()
+    end_date = today + timedelta(days=int(days))
+
     data, remaining = api_get(
         "fixtures",
-        {"league": int(league_id), "next": int(number)}
+        {
+            "league": int(league_id),
+            "from": today.isoformat(),
+            "to": end_date.isoformat(),
+            "timezone": "Asia/Ho_Chi_Minh",
+        },
     )
     rows = []
     for x in data.get("response", []):
@@ -173,15 +182,17 @@ if filtered.empty:
     st.warning("Không tìm thấy giải.")
     st.stop()
 
+# Some API responses put a flag IMAGE URL in `country.flag`.
+# Do not show that raw URL in the dropdown.
 filtered["label"] = filtered.apply(
-    lambda r: f"{r['flag']} {r['country']} — {r['name']}".strip(), axis=1
+    lambda r: f"🌍 {r['country']} — {r['name']}".strip(), axis=1
 )
 league_choice = st.selectbox("🏆 Chọn giải đấu", filtered["label"].tolist())
 league_row = filtered[filtered["label"] == league_choice].iloc[0]
 
 try:
     with st.spinner("Đang tìm các trận sắp tới..."):
-        future, rem = load_future(int(league_row["id"]), 30)
+        future, rem = load_future(int(league_row["id"]), 45)
 except Exception as e:
     st.error(f"Không tải được các trận tương lai: {e}")
     st.stop()
@@ -247,6 +258,6 @@ if st.button("📊 Dự đoán 1X2 trận này", type="primary", use_container_w
         st.warning("API chưa có dữ liệu dự đoán cho trận này.")
 
 st.info(
-    "Chỉ các trận chưa bắt đầu mới được hiển thị. "
-    "Bạn tự chọn trận rồi mới bấm Dự đoán, giúp tiết kiệm quota 100 request/ngày của gói Free."
+    "Chỉ các trận chưa bắt đầu trong 45 ngày tới mới được hiển thị. "
+    "Bạn tự chọn trận rồi mới bấm Dự đoán, giúp tiết kiệm quota của gói Free."
 )
