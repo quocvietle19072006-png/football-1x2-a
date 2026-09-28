@@ -23,15 +23,39 @@ div[data-testid="stMetric"] {border: 1px solid #ddd; border-radius: 12px; paddin
 TOKEN = st.secrets.get("FOOTBALL_DATA_TOKEN", os.getenv("FOOTBALL_DATA_TOKEN", ""))
 BASE = "https://api.football-data.org/v4"
 
+# More competitions. Access still depends on the Football-Data.org plan.
 COMPETITIONS = {
-    "Premier League": "PL",
-    "La Liga": "PD",
-    "Bundesliga": "BL1",
-    "Serie A": "SA",
-    "Ligue 1": "FL1",
-    "Champions League": "CL",
-    "Eredivisie": "DED",
-    "Primeira Liga": "PPL",
+    "🏴 England — Premier League": "PL",
+    "🏴 England — Championship": "ELC",
+    "🏴 England — League One": "EL1",
+    "🏴 England — League Two": "EL2",
+    "🏴 England — National League": "ENL",
+
+    "🇪🇸 Spain — La Liga": "PD",
+    "🇪🇸 Spain — Segunda Division": "SD",
+
+    "🇩🇪 Germany — Bundesliga": "BL1",
+    "🇩🇪 Germany — 2. Bundesliga": "BL2",
+    "🇩🇪 Germany — 3. Bundesliga": "BL3",
+
+    "🇮🇹 Italy — Serie A": "SA",
+    "🇮🇹 Italy — Serie B": "SB",
+
+    "🇫🇷 France — Ligue 1": "FL1",
+    "🇫🇷 France — Ligue 2": "FL2",
+
+    "🇳🇱 Netherlands — Eredivisie": "DED",
+    "🇵🇹 Portugal — Primeira Liga": "PPL",
+    "🇬🇷 Greece — Super League": "GSL",
+
+    "🌍 UEFA — Champions League": "CL",
+    "🌍 UEFA — Europa League": "EL",
+    "🌍 UEFA — Conference League": "EC",
+
+    "🇧🇷 Brazil — Serie A": "BSA",
+    "🇦🇷 Argentina — Primera Division": "PPL",
+    "🇺🇸 USA — MLS": "MLS",
+    "🇲🇽 Mexico — Liga MX": "LMX",
 }
 
 @st.cache_data(ttl=900)
@@ -48,20 +72,29 @@ def api_get(path, params=None):
     return r.json()
 
 def form_features(matches, team):
-    past = [m for m in matches if m.get("status") == "FINISHED" and
-            (m.get("homeTeam", {}).get("name") == team or
-             m.get("awayTeam", {}).get("name") == team)]
+    past = [
+        m for m in matches
+        if m.get("status") == "FINISHED"
+        and (
+            m.get("homeTeam", {}).get("name") == team
+            or m.get("awayTeam", {}).get("name") == team
+        )
+    ]
     past = sorted(past, key=lambda x: x.get("utcDate", ""))[-5:]
     pts, gf, ga = [], [], []
+
     for m in past:
         hs = (m.get("score", {}).get("fullTime", {}) or {}).get("home")
         aws = (m.get("score", {}).get("fullTime", {}) or {}).get("away")
         if hs is None or aws is None:
             continue
-        home = m.get("homeTeam", {}).get("name") == team
-        scored, conceded = (hs, aws) if home else (aws, hs)
-        gf.append(scored); ga.append(conceded)
+
+        is_home = m.get("homeTeam", {}).get("name") == team
+        scored, conceded = (hs, aws) if is_home else (aws, hs)
+        gf.append(scored)
+        ga.append(conceded)
         pts.append(3 if scored > conceded else 1 if scored == conceded else 0)
+
     return (
         float(np.mean(pts)) if pts else 1.0,
         float(np.mean(gf)) if gf else 1.0,
@@ -70,25 +103,32 @@ def form_features(matches, team):
 
 def build_training(matches):
     rows, y = [], []
+
     for m in matches:
         if m.get("status") != "FINISHED":
             continue
+
         hs = (m.get("score", {}).get("fullTime", {}) or {}).get("home")
         aws = (m.get("score", {}).get("fullTime", {}) or {}).get("away")
         if hs is None or aws is None:
             continue
+
         home = m.get("homeTeam", {}).get("name")
         away = m.get("awayTeam", {}).get("name")
         if not home or not away:
             continue
+
         hp, hgf, hga = form_features(matches, home)
         ap, agf, aga = form_features(matches, away)
+
         rows.append([hp-ap, hgf-agf, hga-aga, hgf-aga, 0.15])
         y.append(0 if hs == aws else 1 if hs > aws else 2)
+
     return np.asarray(rows), np.asarray(y)
 
 def poisson_probs(lh, la):
     vals = np.zeros(3)
+
     for h in range(8):
         ph = math.exp(-lh) * lh**h / math.factorial(h)
         for a in range(8):
@@ -97,20 +137,24 @@ def poisson_probs(lh, la):
             vals[0] += p if h > a else 0
             vals[1] += p if h == a else 0
             vals[2] += p if h < a else 0
-    s = vals.sum()
-    return vals / s if s else np.array([1/3, 1/3, 1/3])
+
+    total = vals.sum()
+    return vals / total if total else np.array([1/3, 1/3, 1/3])
 
 def predict(home, away, matches):
     hp, hgf, hga = form_features(matches, home)
     ap, agf, aga = form_features(matches, away)
 
     X, y = build_training(matches)
+
     if len(X) >= 30 and len(np.unique(y)) >= 3:
         model = LogisticRegression(max_iter=2000)
         model.fit(X, y)
+
         x = np.array([[hp-ap, hgf-agf, hga-aga, hgf-aga, 0.15]])
-        ml = np.zeros(3)
         raw = model.predict_proba(x)[0]
+
+        ml = np.zeros(3)
         for cls, p in zip(model.classes_, raw):
             ml[int(cls)] = p
     else:
@@ -118,9 +162,11 @@ def predict(home, away, matches):
 
     home_xg = max(0.25, min(4.0, 1.45 + 0.28*(hgf-agf) - 0.18*(hga-aga)))
     away_xg = max(0.20, min(4.0, 1.15 - 0.20*(hgf-agf) + 0.18*(hga-aga)))
+
     poi = poisson_probs(home_xg, away_xg)
     final = 0.72 * ml + 0.28 * poi
     final = final / final.sum()
+
     return final, home_xg, away_xg
 
 st.title("⚽ Football 1X2 AI")
@@ -134,16 +180,39 @@ competition = st.selectbox("Giải đấu", list(COMPETITIONS.keys()))
 code = COMPETITIONS[competition]
 
 try:
-    finished_data = api_get(f"/competitions/{code}/matches", {"status": "FINISHED"})
-    upcoming_data = api_get(f"/competitions/{code}/matches", {"status": "SCHEDULED"})
+    finished_data = api_get(
+        f"/competitions/{code}/matches",
+        {"status": "FINISHED"}
+    )
+    upcoming_data = api_get(
+        f"/competitions/{code}/matches",
+        {"status": "SCHEDULED"}
+    )
+
     finished = finished_data.get("matches", [])
     upcoming = upcoming_data.get("matches", [])
+
+except requests.HTTPError as e:
+    status = getattr(e.response, "status_code", None)
+    if status == 403:
+        st.error(
+            "Giải đấu này không nằm trong quyền truy cập của gói API hiện tại "
+            "(HTTP 403). Hãy kiểm tra gói Football-Data.org."
+        )
+    elif status == 429:
+        st.error("API đang giới hạn số lượt gọi. Vui lòng thử lại sau.")
+    else:
+        st.error(f"Không lấy được dữ liệu bóng đá: {e}")
+    st.stop()
+
 except Exception as e:
     st.error(f"Không lấy được dữ liệu bóng đá: {e}")
     st.stop()
 
 if not finished:
-    st.warning("Giải đấu chưa có đủ dữ liệu lịch sử.")
+    st.warning(
+        "Giải đấu chưa có dữ liệu lịch sử hoặc token hiện tại không có quyền truy cập."
+    )
     st.stop()
 
 teams = sorted({
@@ -156,7 +225,12 @@ teams = sorted({
     if t
 })
 
+if len(teams) < 2:
+    st.warning("Không đủ đội để tạo trận đấu.")
+    st.stop()
+
 st.subheader("Chọn trận")
+
 home = st.selectbox("Đội nhà", teams, index=0)
 away_options = [t for t in teams if t != home]
 away = st.selectbox("Đội khách", away_options, index=0)
