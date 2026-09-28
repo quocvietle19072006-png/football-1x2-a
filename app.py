@@ -19,7 +19,10 @@ if "SPORTAPI_KEY" not in st.secrets or not st.secrets["SPORTAPI_KEY"]:
     st.stop()
 
 API_KEY = st.secrets["SPORTAPI_KEY"]
-HEADERS = {"Authorization": f"Bearer {API_KEY}"}
+HEADERS = {
+    "Authorization": f"Bearer {API_KEY}",
+    "X-Api-Key": API_KEY,
+}
 
 
 def api_get(path, params=None):
