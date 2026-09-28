@@ -1,263 +1,319 @@
-import os
-import requests
-import pandas as pd
+import math
+from datetime import datetime, timezone
+
 import numpy as np
+import pandas as pd
+import requests
 import streamlit as st
+
+BASE_URL = "https://sportapi.ai/api"
 
 st.set_page_config(page_title="Football 1X2 AI", page_icon="⚽", layout="centered")
 
-st.markdown("""
-<style>
-.block-container {max-width: 760px; padding-top: 1rem; padding-bottom: 2rem;}
-h1 {font-size: 2rem !important;}
-</style>
-""", unsafe_allow_html=True)
+st.title("⚽ Football 1X2 AI")
+st.caption("Chọn giải → chọn trận TƯƠNG LAI → bấm dự đoán → xem xác suất 1/X/2")
 
-BASE_URL = "https://v3.football.api-football.io"
-# Correct API-Football host:
-BASE_URL = "https://v3.football.api-sports.io"
-API_KEY = st.secrets.get("API_FOOTBALL_KEY", os.getenv("API_FOOTBALL_KEY", ""))
-
-if not API_KEY:
-    st.title("⚽ Football 1X2 AI")
-    st.error("Chưa có API_FOOTBALL_KEY trong Secrets.")
-    st.info('Thêm: API_FOOTBALL_KEY = "API_KEY_CỦA_BẠN"')
+if "SPORTAPI_KEY" not in st.secrets or not st.secrets["SPORTAPI_KEY"]:
+    st.error("Chưa có SPORTAPI_KEY trong Secrets.")
+    st.info('Thêm: SPORTAPI_KEY = "API_KEY_CỦA_BẠN"')
     st.stop()
 
+API_KEY = st.secrets["SPORTAPI_KEY"]
+HEADERS = {"Authorization": f"Bearer {API_KEY}"}
 
-def api_get(endpoint, params=None):
-    r = requests.get(
-        f"{BASE_URL}/{endpoint}",
-        headers={"x-apisports-key": API_KEY},
-        params=params or {},
-        timeout=30,
-    )
-    try:
-        data = r.json()
-    except Exception:
-        data = {}
-    remaining = r.headers.get("x-ratelimit-requests-remaining", "?")
-    if r.status_code != 200:
-        raise RuntimeError(f"HTTP {r.status_code}: {data.get('errors', r.text[:200])}")
-    if data.get("errors"):
-        raise RuntimeError(str(data["errors"]))
-    return data, remaining
+
+def api_get(path, params=None):
+    r = requests.get(BASE_URL + path, headers=HEADERS, params=params, timeout=20)
+    if r.status_code >= 400:
+        try:
+            detail = r.json()
+        except Exception:
+            detail = r.text
+        raise RuntimeError(f"HTTP {r.status_code}: {detail}")
+    data = r.json()
+    if isinstance(data, dict) and data.get("success") is False:
+        raise RuntimeError(str(data))
+    return data
+
+
+def as_list(value):
+    return value if isinstance(value, list) else []
+
+
+def get_leagues():
+    data = api_get("/leagues")
+    rows = []
+    groups = data.get("data", data.get("leagues", [])) if isinstance(data, dict) else []
+    if isinstance(groups, dict):
+        groups = [groups]
+    for group in groups:
+        country = group.get("country", "") if isinstance(group, dict) else ""
+        leagues = group.get("leagues", []) if isinstance(group, dict) else []
+        for lg in leagues:
+            if isinstance(lg, dict) and lg.get("id") is not None:
+                rows.append({"id": lg["id"], "name": lg.get("name", ""), "country": country})
+    return rows
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def load_leagues():
-    data, remaining = api_get("leagues", {"current": "true"})
-    rows = []
-    for item in data.get("response", []):
-        league = item.get("league", {})
-        country = item.get("country", {})
-        if league.get("type") != "League":
-            continue
-        rows.append({
-            "id": int(league["id"]),
-            "name": league.get("name", ""),
-            "country": country.get("name", "Other"),
-            "flag": country.get("flag", ""),
-        })
-    df = pd.DataFrame(rows).drop_duplicates("id")
-    if not df.empty:
-        df = df.sort_values(["country", "name"]).reset_index(drop=True)
-    return df, remaining
+def cached_leagues():
+    return get_leagues()
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def load_future(league_id, days=45):
-    # Do NOT use the "next" parameter: the Free plan currently blocks it.
-    # Instead, request a date range for the next 45 days.
-    from datetime import datetime, timedelta, timezone
-
-    today = datetime.now(timezone.utc).date()
-    end_date = today + timedelta(days=int(days))
-
-    data, remaining = api_get(
-        "fixtures",
-        {
-            "league": int(league_id),
-            "from": today.isoformat(),
-            "to": end_date.isoformat(),
-            "timezone": "Asia/Ho_Chi_Minh",
-        },
-    )
-    rows = []
-    for x in data.get("response", []):
-        fx = x.get("fixture", {})
-        status = fx.get("status", {}).get("short")
-        if status not in {"NS", "TBD"}:
-            continue
-        home = x.get("teams", {}).get("home", {})
-        away = x.get("teams", {}).get("away", {})
-        league = x.get("league", {})
-        rows.append({
-            "fixture_id": int(fx.get("id")),
-            "date": fx.get("date", ""),
-            "home": home.get("name", "Home"),
-            "away": away.get("name", "Away"),
-            "league": league.get("name", ""),
-            "country": league.get("country", ""),
-            "round": league.get("round", ""),
-        })
-    df = pd.DataFrame(rows)
-    if not df.empty:
-        df["date"] = pd.to_datetime(df["date"], utc=True, errors="coerce")
-        df = df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
-    return df, remaining
+def league_detail(league_id):
+    return api_get(f"/leagues/{league_id}")
 
 
-def pct_num(value):
+@st.cache_data(ttl=300, show_spinner=False)
+def fixture_detail(fixture_id):
+    return api_get(f"/fixtures/{fixture_id}")
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def team_detail(team_id):
+    return api_get(f"/teams/{team_id}")
+
+
+def fixture_list_from_league(data):
+    league = data.get("league", {}) if isinstance(data, dict) else {}
+    fixtures = league.get("upcoming_fixtures", []) if isinstance(league, dict) else []
+    if not fixtures and isinstance(data, dict):
+        fixtures = data.get("upcoming_fixtures", data.get("fixtures", []))
+    return as_list(fixtures)
+
+
+def parse_dt(x):
+    if not x:
+        return None
     try:
-        return float(str(value).replace("%", "").strip())
+        s = str(x).replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
     except Exception:
         return None
 
 
-def get_prediction(fixture_id):
-    data, remaining = api_get("predictions", {"fixture": int(fixture_id)})
-    response = data.get("response") or []
-    if not response:
-        return None, remaining
+def fixture_id(f):
+    return f.get("id") or f.get("fixture_id")
 
-    pred = response[0].get("predictions", {})
-    percent = pred.get("percent", {})
 
-    home = pct_num(percent.get("home"))
-    draw = pct_num(percent.get("draw"))
-    away = pct_num(percent.get("away"))
+def team_name(f, side):
+    keys = [f"{side}_team", f"{side}_name"]
+    for k in keys:
+        if f.get(k):
+            return str(f[k])
+    obj = f.get(side)
+    if isinstance(obj, dict):
+        return str(obj.get("name", obj.get("team_name", "")))
+    return ""
 
-    if None in (home, draw, away):
-        return None, remaining
 
-    probs = np.array([home, draw, away], dtype=float)
-    probs = probs / probs.sum()
+def team_id_from_fixture(f, side):
+    for k in (f"{side}_team_id", f"{side}_id"):
+        if f.get(k) is not None:
+            return f.get(k)
+    obj = f.get(side)
+    if isinstance(obj, dict):
+        return obj.get("id") or obj.get("team_id")
+    return None
 
-    winner = pred.get("winner") or {}
-    advice = pred.get("advice")
-    score = pred.get("score") or {}
+
+def future_fixtures(league_id):
+    data = league_detail(league_id)
+    fixtures = fixture_list_from_league(data)
+    now = datetime.now(timezone.utc)
+    out = []
+    for f in fixtures:
+        dt = parse_dt(f.get("datetime") or f.get("date_time") or f.get("kickoff"))
+        if dt is None:
+            # Some responses expose only date. Keep it if it is clearly future.
+            try:
+                d = datetime.fromisoformat(str(f.get("date")))
+                dt = d.replace(tzinfo=timezone.utc)
+            except Exception:
+                continue
+        status = str(f.get("status", "")).upper()
+        if dt >= now and status not in {"FT", "AET", "PEN", "FINISHED"}:
+            f = dict(f)
+            f["_dt"] = dt
+            out.append(f)
+    out.sort(key=lambda x: x["_dt"])
+    return out
+
+
+def extract_matches(team_data):
+    team = team_data.get("team", {}) if isinstance(team_data, dict) else {}
+    matches = []
+    for source in [team.get("matches"), team_data.get("matches") if isinstance(team_data, dict) else None]:
+        if isinstance(source, list):
+            matches.extend(source)
+    # de-duplicate
+    seen = set()
+    out = []
+    for m in matches:
+        mid = m.get("id") or m.get("fixture_id")
+        if mid in seen:
+            continue
+        seen.add(mid)
+        out.append(m)
+    return out
+
+
+def result_for_team(m, team_id):
+    hs = m.get("home_score")
+    aws = m.get("away_score")
+    if hs is None or aws is None:
+        return None
+    try:
+        hs, aws = float(hs), float(aws)
+    except Exception:
+        return None
+    home_id = m.get("home_team_id")
+    away_id = m.get("away_team_id")
+    home_name = team_name(m, "home")
+    away_name = team_name(m, "away")
+    is_home = home_id == team_id if team_id is not None else False
+    if team_id is None:
+        return None
+    if home_id != team_id and away_id != team_id:
+        return None
+    gf, ga = (hs, aws) if is_home else (aws, hs)
+    pts = 3 if gf > ga else 1 if gf == ga else 0
+    return {"gf": gf, "ga": ga, "pts": pts, "home": is_home, "date": m.get("date") or m.get("datetime") or ""}
+
+
+def team_form(team_id):
+    data = team_detail(team_id)
+    matches = extract_matches(data)
+    vals = [result_for_team(m, team_id) for m in matches]
+    vals = [v for v in vals if v]
+    vals.sort(key=lambda x: str(x["date"]), reverse=True)
+    vals = vals[:10]
+    if not vals:
+        return {"n": 0, "ppg": 1.0, "gf": 1.2, "ga": 1.2, "home_ppg": 1.0, "away_ppg": 1.0}
+    n = len(vals)
     return {
-        "probs": probs,
-        "winner": winner.get("name"),
-        "advice": advice,
-        "home_score": score.get("halftime", {}).get("home"),
-        "away_score": score.get("halftime", {}).get("away"),
-    }, remaining
+        "n": n,
+        "ppg": sum(v["pts"] for v in vals) / n,
+        "gf": sum(v["gf"] for v in vals) / n,
+        "ga": sum(v["ga"] for v in vals) / n,
+        "home_ppg": (sum(v["pts"] for v in vals if v["home"]) / max(1, sum(v["home"] for v in vals))),
+        "away_ppg": (sum(v["pts"] for v in vals if not v["home"]) / max(1, sum(not v["home"] for v in vals))),
+    }
 
 
-st.title("⚽ Football 1X2 AI")
-st.caption("Chọn giải → chọn trận TƯƠNG LAI → xem xác suất 1/X/2")
+def poisson_probs(lam_home, lam_away, max_goals=8):
+    probs = {}
+    ph = [math.exp(-lam_home) * lam_home**k / math.factorial(k) for k in range(max_goals + 1)]
+    pa = [math.exp(-lam_away) * lam_away**k / math.factorial(k) for k in range(max_goals + 1)]
+    home = draw = away = 0.0
+    for i, p1 in enumerate(ph):
+        for j, p2 in enumerate(pa):
+            p = p1 * p2
+            if i > j:
+                home += p
+            elif i == j:
+                draw += p
+            else:
+                away += p
+    s = home + draw + away
+    return {"1": home / s, "X": draw / s, "2": away / s}
+
 
 try:
-    leagues, remaining = load_leagues()
+    leagues = cached_leagues()
 except Exception as e:
     st.error(f"Không tải được danh sách giải: {e}")
     st.stop()
 
-if leagues.empty:
-    st.warning("Không có danh sách giải đấu.")
-    st.stop()
+country_options = sorted({x["country"] for x in leagues if x["country"]})
+st.subheader("🌍 Quốc gia")
+country = st.selectbox("", ["Tất cả"] + country_options, label_visibility="collapsed")
 
-c1, c2 = st.columns(2)
-with c1:
-    countries = ["Tất cả"] + sorted(leagues["country"].unique().tolist())
-    country = st.selectbox("🌍 Quốc gia", countries)
-
-with c2:
-    search = st.text_input("🔎 Tìm giải", placeholder="National League...")
-
-filtered = leagues.copy()
-if country != "Tất cả":
-    filtered = filtered[filtered["country"] == country]
-
+filtered = [x for x in leagues if country == "Tất cả" or x["country"] == country]
+search = st.text_input("🔎 Tìm giải", placeholder="Ví dụ: National League")
 if search.strip():
     q = search.strip().lower()
-    filtered = filtered[
-        filtered["name"].str.lower().str.contains(q, na=False)
-        | filtered["country"].str.lower().str.contains(q, na=False)
-    ]
+    filtered = [x for x in filtered if q in x["name"].lower() or q in x["country"].lower()]
 
-if filtered.empty:
-    st.warning("Không tìm thấy giải.")
+if not filtered:
+    st.warning("Không tìm thấy giải phù hợp.")
     st.stop()
 
-# Some API responses put a flag IMAGE URL in `country.flag`.
-# Do not show that raw URL in the dropdown.
-filtered["label"] = filtered.apply(
-    lambda r: f"🌍 {r['country']} — {r['name']}".strip(), axis=1
-)
-league_choice = st.selectbox("🏆 Chọn giải đấu", filtered["label"].tolist())
-league_row = filtered[filtered["label"] == league_choice].iloc[0]
+labels = [f"{x['country']} — {x['name']}" for x in filtered]
+choice = st.selectbox("🏆 Chọn giải đấu", labels)
+selected_league = filtered[labels.index(choice)]
 
 try:
-    with st.spinner("Đang tìm các trận sắp tới..."):
-        future, rem = load_future(int(league_row["id"]), 45)
+    fixtures = future_fixtures(selected_league["id"])
 except Exception as e:
     st.error(f"Không tải được các trận tương lai: {e}")
     st.stop()
 
-st.caption(f"League ID: {int(league_row['id'])} • API còn khoảng: {rem} request/ngày")
-
-if future.empty:
-    st.warning("Hiện API chưa trả về trận sắp tới cho giải này.")
+if not fixtures:
+    st.info("Giải này hiện chưa có trận tương lai trong dữ liệu SportAPI.")
     st.stop()
 
-# Convert to Vietnam time for display.
-future["date_vn"] = future["date"].dt.tz_convert("Asia/Ho_Chi_Minh")
-future["label"] = future.apply(
-    lambda r: (
-        f"{r['date_vn'].strftime('%d/%m %H:%M')} — "
-        f"{r['home']} vs {r['away']}"
-    ),
-    axis=1,
-)
+fixture_labels = []
+for f in fixtures:
+    dt = f["_dt"].astimezone()
+    h = team_name(f, "home") or "Đội nhà"
+    a = team_name(f, "away") or "Đội khách"
+    fixture_labels.append(f"{dt:%d/%m %H:%M} — {h} vs {a}")
 
-fixture_choice = st.selectbox("⚽ Chọn trận tương lai", future["label"].tolist())
-fixture = future[future["label"] == fixture_choice].iloc[0]
+fidx = st.selectbox("⚽ Chọn trận TƯƠNG LAI", range(len(fixtures)), format_func=lambda i: fixture_labels[i])
+selected = fixtures[fidx]
 
-st.divider()
-st.subheader(f"{fixture['home']}  vs  {fixture['away']}")
-st.write(
-    f"📅 **{fixture['date_vn'].strftime('%d/%m/%Y %H:%M')} (giờ Việt Nam)**"
-)
-if fixture["round"]:
-    st.caption(f"{fixture['league']} • {fixture['round']}")
+st.write(f"**{team_name(selected, 'home')}**  vs  **{team_name(selected, 'away')}**")
 
-if st.button("📊 Dự đoán 1X2 trận này", type="primary", use_container_width=True):
-    with st.spinner("Đang tính xác suất..."):
+if st.button("📊 Dự đoán 1X2", type="primary", use_container_width=True):
+    with st.spinner("Đang phân tích phong độ 2 đội..."):
         try:
-            result, pred_remaining = get_prediction(int(fixture["fixture_id"]))
+            fid = fixture_id(selected)
+            if fid:
+                detail = fixture_detail(fid)
+                fx = detail.get("fixture", detail) if isinstance(detail, dict) else {}
+            else:
+                fx = selected
+
+            home_id = team_id_from_fixture(fx, "home") or team_id_from_fixture(selected, "home")
+            away_id = team_id_from_fixture(fx, "away") or team_id_from_fixture(selected, "away")
+
+            if home_id is None or away_id is None:
+                st.error("API chưa trả về ID của hai đội trong trận này, nên chưa thể tính 1X2.")
+                st.stop()
+
+            hf = team_form(home_id)
+            af = team_form(away_id)
+
+            # Simple transparent model from recent form + scoring/conceding.
+            home_attack = max(0.25, hf["gf"])
+            away_attack = max(0.25, af["gf"])
+            home_def = max(0.25, hf["ga"])
+            away_def = max(0.25, af["ga"])
+
+            lam_home = 0.35 + 0.48 * home_attack + 0.22 * away_def + 0.12 * max(0, hf["ppg"] - af["ppg"])
+            lam_away = 0.22 + 0.48 * away_attack + 0.22 * home_def + 0.10 * max(0, af["ppg"] - hf["ppg"])
+            lam_home = float(np.clip(lam_home, 0.35, 3.5))
+            lam_away = float(np.clip(lam_away, 0.25, 3.2))
+
+            probs = poisson_probs(lam_home, lam_away)
+            best = max(probs, key=probs.get)
+            names = {"1": "Chủ nhà thắng", "X": "Hòa", "2": "Đội khách thắng"}
+
+            st.subheader("📈 Xác suất 1X2")
+            c1, c2, c3 = st.columns(3)
+            c1.metric("1 — Chủ nhà", f"{probs['1']*100:.1f}%")
+            c2.metric("X — Hòa", f"{probs['X']*100:.1f}%")
+            c3.metric("2 — Đội khách", f"{probs['2']*100:.1f}%")
+            st.success(f"Xác suất cao nhất theo mô hình: **{best} — {names[best]}**")
+
+            st.caption(
+                f"Mô hình tham khảo từ tối đa 10 trận gần nhất của mỗi đội. "
+                f"Dữ liệu dùng: {hf['n']} trận gần nhất của chủ nhà và {af['n']} trận của đội khách."
+            )
         except Exception as e:
-            result = None
-            pred_remaining = "?"
-            st.error(f"Không lấy được dự đoán: {e}")
-
-    if result is not None:
-        p1, px, p2 = result["probs"]
-
-        cols = st.columns(3)
-        for col, title, value in zip(
-            cols,
-            ["1 — Chủ nhà", "X — Hòa", "2 — Đội khách"],
-            [p1, px, p2]
-        ):
-            with col:
-                st.metric(title, f"{value * 100:.1f}%")
-
-        best = ["1 — Chủ nhà", "X — Hòa", "2 — Đội khách"][int(np.argmax(result["probs"]))]
-        st.success(f"Xác suất cao nhất: **{best}**")
-
-        if result["winner"]:
-            st.write(f"🏆 API-Football dự đoán đội thắng: **{result['winner']}**")
-        if result["advice"]:
-            st.write(f"💡 Nhận định API: {result['advice']}")
-
-        st.caption(f"API còn khoảng: {pred_remaining} request/ngày")
-    else:
-        st.warning("API chưa có dữ liệu dự đoán cho trận này.")
-
-st.info(
-    "Chỉ các trận chưa bắt đầu trong 45 ngày tới mới được hiển thị. "
-    "Bạn tự chọn trận rồi mới bấm Dự đoán, giúp tiết kiệm quota của gói Free."
-)
+            st.error(f"Không thể dự đoán trận này: {e}")
