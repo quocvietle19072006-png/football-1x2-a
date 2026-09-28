@@ -198,48 +198,123 @@ def extract_matches(team_data):
     return out
 
 
-def result_for_team(m, team_id):
+def norm_name(x):
+    return " ".join(str(x or "").lower().replace("-", " ").split())
+
+
+def result_for_team(m, team_id=None, team_name_value=""):
     hs = m.get("home_score")
     aws = m.get("away_score")
     if hs is None or aws is None:
-        return None
+        # Some responses may nest scores.
+        scores = m.get("score") if isinstance(m.get("score"), dict) else {}
+        hs = scores.get("home", hs)
+        aws = scores.get("away", aws)
     try:
         hs, aws = float(hs), float(aws)
     except Exception:
         return None
-    home_id = m.get("home_team_id")
-    away_id = m.get("away_team_id")
-    home_name = team_name(m, "home")
-    away_name = team_name(m, "away")
-    is_home = home_id == team_id if team_id is not None else False
-    if team_id is None:
-        return None
-    if home_id != team_id and away_id != team_id:
+
+    home_id = m.get("home_team_id") or m.get("home_id")
+    away_id = m.get("away_team_id") or m.get("away_id")
+    home_obj = m.get("home_team")
+    away_obj = m.get("away_team")
+    home_name = home_obj.get("name", "") if isinstance(home_obj, dict) else str(home_obj or "")
+    away_name = away_obj.get("name", "") if isinstance(away_obj, dict) else str(away_obj or "")
+    if isinstance(home_obj, dict):
+        home_id = home_id or home_obj.get("id") or home_obj.get("team_id")
+    if isinstance(away_obj, dict):
+        away_id = away_id or away_obj.get("id") or away_obj.get("team_id")
+
+    is_home = False
+    if team_id is not None and (home_id == team_id or str(home_id) == str(team_id)):
+        is_home = True
+        belongs = True
+    elif team_id is not None and (away_id == team_id or str(away_id) == str(team_id)):
+        is_home = False
+        belongs = True
+    else:
+        q = norm_name(team_name_value)
+        belongs_home = q and q == norm_name(home_name)
+        belongs_away = q and q == norm_name(away_name)
+        if not (belongs_home or belongs_away):
+            return None
+        is_home = belongs_home
+        belongs = True
+
+    if not belongs:
         return None
     gf, ga = (hs, aws) if is_home else (aws, hs)
     pts = 3 if gf > ga else 1 if gf == ga else 0
-    return {"gf": gf, "ga": ga, "pts": pts, "home": is_home, "date": m.get("date") or m.get("datetime") or ""}
+    return {"gf": gf, "ga": ga, "pts": pts, "home": is_home,
+            "date": m.get("date") or m.get("datetime") or m.get("kickoff") or ""}
 
 
-def team_form(team_id):
+def team_form(team_id, team_name_value=""):
     data = team_detail(team_id)
+    team_obj = data.get("team", {}) if isinstance(data, dict) else {}
+    real_name = team_obj.get("name", team_name_value) if isinstance(team_obj, dict) else team_name_value
     matches = extract_matches(data)
-    vals = [result_for_team(m, team_id) for m in matches]
+    vals = [result_for_team(m, team_id, real_name) for m in matches]
     vals = [v for v in vals if v]
     vals.sort(key=lambda x: str(x["date"]), reverse=True)
     vals = vals[:10]
     if not vals:
-        return {"n": 0, "ppg": 1.0, "gf": 1.2, "ga": 1.2, "home_ppg": 1.0, "away_ppg": 1.0}
+        return {"n": 0}
     n = len(vals)
+    home_vals = [v for v in vals if v["home"]]
+    away_vals = [v for v in vals if not v["home"]]
     return {
         "n": n,
         "ppg": sum(v["pts"] for v in vals) / n,
         "gf": sum(v["gf"] for v in vals) / n,
         "ga": sum(v["ga"] for v in vals) / n,
-        "home_ppg": (sum(v["pts"] for v in vals if v["home"]) / max(1, sum(v["home"] for v in vals))),
-        "away_ppg": (sum(v["pts"] for v in vals if not v["home"]) / max(1, sum(not v["home"] for v in vals))),
+        "home_ppg": sum(v["pts"] for v in home_vals) / len(home_vals) if home_vals else sum(v["pts"] for v in vals) / n,
+        "away_ppg": sum(v["pts"] for v in away_vals) / len(away_vals) if away_vals else sum(v["pts"] for v in vals) / n,
+        "source": "matches",
     }
 
+
+@st.cache_data(ttl=900, show_spinner=False)
+def league_standings(league_id):
+    return api_get(f"/standings/{league_id}")
+
+
+def form_score(form):
+    vals = []
+    for x in form if isinstance(form, list) else []:
+        x = str(x).upper().strip()
+        if x == "W": vals.append(3)
+        elif x == "D": vals.append(1)
+        elif x == "L": vals.append(0)
+    return sum(vals) / len(vals) if vals else None
+
+
+def standings_form(league_id, team_id, team_name_value=""):
+    data = league_standings(league_id)
+    obj = data.get("data", {}) if isinstance(data, dict) else {}
+    rows = obj.get("standings", []) if isinstance(obj, dict) else []
+    q = norm_name(team_name_value)
+    for row in rows if isinstance(rows, list) else []:
+        rteam = row.get("team", {}) if isinstance(row, dict) else {}
+        rid = row.get("team_id") or row.get("id") or (rteam.get("id") if isinstance(rteam, dict) else None)
+        rname = row.get("team_name") or (rteam.get("name") if isinstance(rteam, dict) else "")
+        if (team_id is not None and str(rid) == str(team_id)) or (q and q == norm_name(rname)):
+            f = row.get("form")
+            score = form_score(f)
+            if score is not None:
+                return {"n": len(f), "ppg": score, "gf": None, "ga": None, "source": "standings"}
+    return {"n": 0}
+
+
+def get_team_signal(league_id, team_id, team_name_value):
+    tf = team_form(team_id, team_name_value)
+    if tf.get("n", 0) >= 3:
+        return tf
+    sf = standings_form(league_id, team_id, team_name_value)
+    if sf.get("n", 0) > 0:
+        return sf
+    return {"n": 0}
 
 def poisson_probs(lam_home, lam_away, max_goals=8):
     probs = {}
@@ -322,17 +397,29 @@ if st.button("📊 Dự đoán 1X2", type="primary", use_container_width=True):
                 st.error("API chưa trả về ID của hai đội trong trận này, nên chưa thể tính 1X2.")
                 st.stop()
 
-            hf = team_form(home_id)
-            af = team_form(away_id)
+            home_name = team_name(fx, "home") or team_name(selected, "home")
+            away_name = team_name(fx, "away") or team_name(selected, "away")
+            hf = get_team_signal(selected_league["id"], home_id, home_name)
+            af = get_team_signal(selected_league["id"], away_id, away_name)
 
-            # Simple transparent model from recent form + scoring/conceding.
-            home_attack = max(0.25, hf["gf"])
-            away_attack = max(0.25, af["gf"])
-            home_def = max(0.25, hf["ga"])
-            away_def = max(0.25, af["ga"])
+            # Không dùng số mặc định nếu không có dữ liệu.
+            if hf.get("n", 0) == 0 or af.get("n", 0) == 0:
+                st.warning("Không đủ dữ liệu lịch sử của một hoặc cả hai đội để tính 1X2. App sẽ không tự ép ra kết quả.")
+                st.stop()
 
-            lam_home = 0.35 + 0.48 * home_attack + 0.22 * away_def + 0.12 * max(0, hf["ppg"] - af["ppg"])
-            lam_away = 0.22 + 0.48 * away_attack + 0.22 * home_def + 0.10 * max(0, af["ppg"] - hf["ppg"])
+            if hf.get("source") == "matches" and af.get("source") == "matches":
+                home_attack = max(0.25, hf["gf"])
+                away_attack = max(0.25, af["gf"])
+                home_def = max(0.25, hf["ga"])
+                away_def = max(0.25, af["ga"])
+                lam_home = 0.35 + 0.48 * home_attack + 0.22 * away_def + 0.12 * max(0, hf["ppg"] - af["ppg"])
+                lam_away = 0.22 + 0.48 * away_attack + 0.22 * home_def + 0.10 * max(0, af["ppg"] - hf["ppg"])
+            else:
+                # Fallback bằng phong độ W/D/L của bảng xếp hạng.
+                diff = hf["ppg"] - af["ppg"]
+                lam_home = 1.25 + 0.28 * diff
+                lam_away = 1.05 - 0.20 * diff
+
             lam_home = float(np.clip(lam_home, 0.35, 3.5))
             lam_away = float(np.clip(lam_away, 0.25, 3.2))
 
@@ -348,8 +435,8 @@ if st.button("📊 Dự đoán 1X2", type="primary", use_container_width=True):
             st.success(f"Xác suất cao nhất theo mô hình: **{best} — {names[best]}**")
 
             st.caption(
-                f"Mô hình tham khảo từ tối đa 10 trận gần nhất của mỗi đội. "
-                f"Dữ liệu dùng: {hf['n']} trận gần nhất của chủ nhà và {af['n']} trận của đội khách."
+                f"Mô hình dùng dữ liệu thực tế của hai đội. "
+                f"Nguồn: {hf.get('source', '')} ({hf['n']}) và {af.get('source', '')} ({af['n']})."
             )
         except Exception as e:
             st.error(f"Không thể dự đoán trận này: {e}")
