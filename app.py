@@ -370,3 +370,4 @@ with st.expander("ℹ️ Cách hoạt động"):
         "App lấy danh sách giải đang hoạt động từ API-Football, sau đó tải lịch sử "
         "trận đã kết thúc và các trận sắp tới của giải được chọn. "
         "Dự đoán kết hợp Logistic Regression (nếu đủ dữ liệu) với Poisson xG."
+    )
