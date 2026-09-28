@@ -22,6 +22,7 @@ API_KEY = st.secrets["SPORTAPI_KEY"]
 HEADERS = {
     "Authorization": f"Bearer {API_KEY}",
     "X-Api-Key": API_KEY,
+    "Accept": "application/json",
 }
 
 
@@ -33,7 +34,15 @@ def api_get(path, params=None):
         except Exception:
             detail = r.text
         raise RuntimeError(f"HTTP {r.status_code}: {detail}")
-    data = r.json()
+    try:
+        data = r.json()
+    except ValueError:
+        ct = r.headers.get("content-type", "")
+        preview = r.text[:500].replace("\n", " ").strip()
+        raise RuntimeError(
+            f"API không trả JSON (HTTP {r.status_code}, Content-Type: {ct}). "
+            f"Phản hồi: {preview}"
+        )
     if isinstance(data, dict) and data.get("success") is False:
         raise RuntimeError(str(data))
     return data
