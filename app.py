@@ -314,3 +314,4 @@ st.caption(
     "Giới hạn quan trọng: app chỉ có thể hiển thị môn, trận, market và odds mà The Odds API trả về cho key/gói/khu vực của bạn. "
     "The Odds API không đảm bảo bao phủ toàn bộ esports hoặc mọi market live. Mốc thời gian đã qua không tự chứng minh trận đang live. "
     "Edge ở đây được ước tính từ odds thị trường đã loại margin, không phải dự đoán AI độc lập và không đảm bảo lợi nhuận."
+)
